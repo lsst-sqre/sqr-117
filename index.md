@@ -158,6 +158,16 @@ endpoints per collection.
 The `sia` codebase already defines `BASE_RESOURCE_IDENTIFIER = "ivo://rubin/"`,
 which as far as I am aware is the first and only RSP service that embeds an IVO identifier.
 
+**SODA** (`vo-cutouts`) provides image cutouts via the IVOA SODA standard.
+It exposes the endpoint `/api/cutout` which serves both sync (`/api/cutout/sync`)
+and async (`/api/cutout/jobs`) interfaces for all datasets, which are specified via a query parameter.
+The Repertoire rules already include `ivoa_standard_id` for both SODA versions.
+
+**DataLink** (`datalinker`) provides links between data products and related
+data resources (e.g. cutouts). DataLink services are generally not registered as a
+standalone service in the IVOA registry, instead clients discover them as a result of a TAP query rather than searching 
+for them by standard ID. Therefore we will not include them as a registration target, at least not initially.
+
 A **ConeSearch** service will also soon be available.
 Registration of ConeSearch can be added later once the service is deployed.
 
@@ -212,7 +222,8 @@ Proposed IVOIDs:
 | Authority | `ivo://rubin` |
 | Organisation | `ivo://rubin/org` |
 | TAP | `ivo://rubin/tap` |
-| SIAv2 DP1 (IDF) | `ivo://rubin/sia/dp1` |
+| SIAv2 DP1 | `ivo://rubin/sia/dp1` |
+| SODA cutout | `ivo://rubin/cutout` |
 
 ### 4.2 Authority Record
 
@@ -264,7 +275,26 @@ Key fields (IDF example):
 | Access URL | `https://data.lsst.cloud/api/sia/dp1/query` (derived from Repertoire) |
 | Interface type | `ParamHTTP` |
 
-### 4.6 Required VOResource Fields
+### 4.6 SODA Cutout Service Record
+
+The SODA record is a single record for the entire cutout service. This is different from data-collection
+specific services like SIA.
+
+The record carries two capabilities, one for each interface:
+
+| Field | Value |
+|-------|-------|
+| IVOID | `ivo://rubin/cutout` |
+| Standard ID (async) | `ivo://ivoa.net/std/SODA#async-1.0` |
+| Access URL (async) | `https://data.lsst.cloud/api/cutout/jobs` (derived from Repertoire) |
+| Standard ID (sync) | `ivo://ivoa.net/std/SODA#sync-1.0` |
+| Access URL (sync) | `https://data.lsst.cloud/api/cutout/sync` (derived from Repertoire) |
+| Interface type | `ParamHTTP` |
+
+Both `ivoa_standard_id` values are already present in the Repertoire Phalanx
+rules for `vo-cutouts`, so no prerequisite config changes are needed.
+
+### 4.7 Required VOResource Fields
 
 Every resource record must satisfy the following VOResource 1.1 requirements,
 regardless of the specific record type.
@@ -275,7 +305,7 @@ regardless of the specific record type.
 |-----------|-------------|
 | `status` | Must be `active`, `inactive`, or `deleted`. All our records will use `active`. |
 | `created` | ISO 8601 datestamp when the record was first created. Set once and never changed. |
-| `updated` | ISO 8601 datestamp of the last meaningful change. Bumped manually in Phalanx values when a record changes. |
+| `updated` | ISO 8601 datestamp of the last meaningful change. Set automatically to the service startup time. |
 
 **`<curation>` block** (required)
 
@@ -324,7 +354,7 @@ and serialise to IVOA compliant XML via `.to_xml()`.
 
 The following snippet shows how the `ResourceRecordFactory` might build a TAP
 record. The access URL and standard ID come from Repertoire's discovery data, whereas
-the IVOID, title  and datestamp come from the registry config in Repertoire.
+the IVOID and title come from the registry config in Repertoire, and the datestamp is set automatically at startup.
 
 ```python
 from vo_models.voresource.models import Capability, Interface, AccessURL
@@ -334,8 +364,8 @@ tap_url = discovery.datasets["dp02"].services["tap"].versions["v1"].url
 standard_id = discovery.datasets["dp02"].services["tap"].versions["v1"].ivoa_standard_id
 
 tap_record = TableAccess(
-    created="2026-04-09T00:00:00Z",
-    updated=registry_config.services["tap"].updated,
+    created=registry_config.services["tap"].created,
+    updated=startup_timestamp,
     status="active",
     title=registry_config.services["tap"].title,
     identifier=registry_config.services["tap"].ivoid,
@@ -389,9 +419,8 @@ There are obvious benefits to this, as this way there is no separate service to 
 and maintain, and the registry reuses Repertoire's configuration loading, startup
 lifecycle and Phalanx values structure, avoiding duplicated configuration.
 
-The registry router will be mounted at `/registry` and gated on a
-`registry.enabled` config flag, so it can be turned on for IDF environments and left off
-everywhere else where it is not needed.
+The registry router will be mounted at `/registry` and is always active.
+Environments that do not wish to be harvested by the IVOA simply do not register with the RofR.
 
 ### 6.2 Resource Record Strategy
 
@@ -425,12 +454,24 @@ the registry config.
 
 ### 6.3 Record Datestamps
 
-Worth noting that there is a `datestamp` on each record that the OAI-PMH harvesters use to 
-determine what has changed since their last pull. 
-For each service record, this datestamp is the `updated` field in the registry config. 
+Each resource record carries a `datestamp` that OAI-PMH harvesters use to determine what has
+changed since their last pull.
 
-Thus for our RSP Registry we will have to bump it in the Phalanx values whenever the content of 
-a resource record changes meaningfully (e.g. title change, new collection, changed URL). 
+The `updated` field is set automatically to the service startup timestamp rather than being stored
+in configuration.
+The timestamp is captured once in the FastAPI lifespan function and passed to `ResourceRecordFactory`
+when it builds the records at startup.
+Since records are built once and cached in `RecordStore`, `updated` is fixed for the lifetime of the pod.
+
+This eliminates any operator burden from manually bumping a timestamp in Phalanx
+values whenever a record changes.
+
+Worth noting the trade-off however, which is that harvesters will re-fetch all records on
+every deployment, even if nothing changed. At our scale (5-10 records), this re-harvest cost is
+generally negligible and the simpler approach seems preferable.
+
+The `created` field (set once when the record is first published) is still stored in the registry
+config, as it must remain stable across deployments.
 
 The initial implementation will not track deleted records, records can only
 be added or updated. If we for whatever reason want support for soft-deleting in future, we can add it later.
@@ -625,8 +666,7 @@ has no concept of.
 The registry could be deployed in two ways.
 
 **Option A - inside Repertoire**: As discussed above, the OAI-PMH endpoints are added as a
-conditional router to the existing Repertoire FastAPI application, gated on
-`registry.enabled`. 
+router to the existing Repertoire FastAPI application.
 The `ResourceRecordFactory` reads URLs and standard IDs
 directly from Repertoire's in-memory `Discovery` object at startup. 
 
@@ -670,13 +710,32 @@ briefly until Kubernetes restarts the pod.
 This is acceptable for the initial deployment given what we expect to be low harvest frequency of IVOA harvesters.
 
 
-### 8.4 Per-Environment Registry
+### 8.4 TAP-Specific Rule Fields
+
+A TAP `TableAccess` registry record requires fields that have no equivalent in the generic
+Repertoire discovery model, including the ADQL version and whether table upload is supported.
+
+Rather than introducing a new rule type discriminator (`type: "tap"`), these fields are represented
+as an optional `tap:` sub-key on the existing `InternalServiceRule`.
+If `tap:` is present the registry treats the service as a TAP endpoint and produces a
+`TAPRegExt` record. If it is absent, the service is omitted from the registry or represented as a
+generic service record.
+
+This avoids allows us to keep the TAP configuration co-located with the rest of the service rule
+rather than split across a separate registry configuration section.
+
+Table metadata (the list of schemas and tables the TAP service exposes) is explicitly excluded
+from the MVP. It is complex to assemble correctly and the `TableAccess` record is valid without
+it. It can be added in a follow-on once we have a clearer strategy for reusing the felis
+metadata that Repertoire already handles for TAP_SCHEMA population.
+
+### 8.5 Per-Environment Registry
 
 Each RSP deployment has its own service URLs and potentially a different set of
-active services. Our plan is to deploy the registry for our integration and development IDF environments by 
-setting the `registry.enabled: true`, but to only register prod in the RofR.
-This way we can still exercise and test our Registry service, and potentially allow other tools to use it internally in the 
-RSP (Firefly) for service discovery.
+active services. The registry is active on all environments, but only the production IDF
+will be registered with the RofR.
+This way we can still exercise and test our Registry service on integration and development environments,
+and potentially allow other tools to use it internally in the RSP (e.g. Firefly) for service discovery.
 
 ## 9. Configuration
 
@@ -693,24 +752,70 @@ Repertoire already supplies most of what a resource record needs:
 - **The OAI-PMH base URL** is derived from `base_hostname` as
   `https://{base_hostname}/registry/oai`
 
-The registry config therefore contains only what Repertoire cannot supply: IVO
-identifiers, display titles, admin contact and datestamps. 
+IVOA-specific metadata for individual services including `ivoid`, `title` and `created` will live in the
+existing Repertoire rules section (alongside the URL template and standard ID).
 
-Service entries are keyed by Phalanx application name (and dataset name for per-collection
-services like SIA) so the factory can look up URLs and standard IDs from the
-discovery data without duplication.
+The top-level `registry:` section will hold only authority and organisation-level configuration that
+has no equivalent in the existing Repertoire discovery data.
 
-Each record carries two datestamp fields:
+Each record will include a `created` datestamp, which is the date the record was first published.
+This is set once in config and will not change.
 
-- `created` - the date the record was first published. Set once and never changed,
-  even when the record content is updated. This is distinct from `updated`.
-- `updated` - the date of the last meaningful change to the record. This is the
-  field OAI-PMH harvesters use to detect changes. It must be bumped in the Phalanx
-  values whenever the record content changes (see Section 6.3).
+As discussed earlier, the `updated` datestamp is set automatically to the service startup time (see Section 6.3)
+and will not be stored in the config.
+
+Per-environment overrides for registry metadata such as a different `created` date on
+will use be done via the standard Phalanx per-environment`values-{env}.yaml` override mechanism.
 
 ```yaml
+rules:
+  - type: data
+    name: tap
+    datasets: [dp02, dp1]
+    template: "https://{{base_hostname}}/api/tap"
+    registry:
+      ivoid: "ivo://rubin/tap"
+      title: "Rubin Observatory TAP Service"
+      created: "2026-04-13T00:00:00Z"
+    tap:
+      adqlVersion: "2.1"
+      uploadSupported: true
+
+  - type: data
+    name: vo-cutouts
+    datasets: [dp02, dp1]
+    template: "https://{{base_hostname}}/api/cutout"
+    versions:
+      v1sync:
+        template: "/api/cutout/sync"
+        ivoaStandardId: "ivo://ivoa.net/std/SODA#sync-1.0"
+      v1async:
+        template: "/api/cutout/jobs"
+        ivoaStandardId: "ivo://ivoa.net/std/SODA#async-1.0"
+    registry:
+      ivoid: "ivo://rubin/cutout"
+      title: "Rubin Observatory Image Cutout Service"
+      created: "2026-04-13T00:00:00Z"
+
+  - type: data
+    name: sia
+    datasets: [dp02, dp1]
+    template: "https://{{base_hostname}}/api/sia/{{dataset}}"
+    versions:
+      v2:
+        template: "/api/sia/{{dataset}}/query"
+        ivoaStandardId: "ivo://ivoa.net/std/SIA#query-2.0"
+    registry:
+      dp1:
+        ivoid: "ivo://rubin/sia/dp1"
+        title: "Rubin Observatory SIAv2 Service (DP1)"
+        created: "2026-04-13T00:00:00Z"
+      dp02:
+        ivoid: "ivo://rubin/sia/dp02"
+        title: "Rubin Observatory SIAv2 Service (DP02)"
+        created: "2026-04-14T00:00:00Z"
+
 registry:
-  enabled: true
   authority: "ivo://rubin"
   repositoryName: "Rubin Observatory VO Publishing Registry"
   adminEmail: "our-email"
@@ -719,28 +824,8 @@ registry:
     ivoid: "ivo://rubin/org"
     title: "NSF-DOE Vera C. Rubin Observatory"
     homepage: "https://rubinobservatory.org"
-    created: "2026-01-01T00:00:00Z"
-    updated: "2026-04-09T00:00:00Z"
-
-  services:
-    tap:
-      ivoid: "ivo://rubin/tap"
-      title: "Rubin Observatory TAP Service"
-      created: "2026-01-01T00:00:00Z"
-      updated: "2026-04-09T00:00:00Z"
-
-    # For per-collection services, the second key is the dataset name,
-    # matching config.available_datasets.
-    sia:
-      dp1:
-        ivoid: "ivo://rubin/sia/dp1"
-        title: "Rubin Observatory SIAv2 Service (DP1)"
-        created: "2026-01-01T00:00:00Z"
-        updated: "2026-04-09T00:00:00Z"
+    created: "2026-04-13T00:00:00Z"
 ```
-
-When `registry.enabled` is `false` (the default), the `/registry` router is
-not mounted.
 
 The Authority record is generated from the top-level `authority`,
 `repositoryName`, and `adminEmail` fields, and thus no separate Authority block is
@@ -759,20 +844,33 @@ https://wiki.ivoa.net/twiki/bin/view/IVOA/GettingIntoTheRegistry.
 The registry will ship as part of the existing `repertoire` Phalanx application
 at `applications/repertoire/`.
 
-`registry.enabled` is set per environment in `values-{env}.yaml`:
+The registry config is set per environment in `values-{env}.yaml`:
 
 ```yaml
 repertoire:
   config:
     registry:
-      enabled: true
       authority: "ivo://rubin"
       repositoryName: "Rubin Observatory VO Publishing Registry"
       adminEmail: "our-email"
+      organisation:
+        ivoid: "ivo://rubin/org"
+        title: "NSF-DOE Vera C. Rubin Observatory"
+        homepage: "https://rubinobservatory.org"
+        created: "2026-04-13T00:00:00Z"
+
+    rules:
+      - type: data
+        name: tap
+        datasets: [dp02, dp1]
+        registry:
+          ivoid: "ivo://rubin/tap"
+          title: "Rubin Observatory TAP Service"
+          created: "2026-04-13T00:00:00Z"
       ...
 ```
 
-Once the registry is live on the IDF, the OAI-PMH endpoint is run through tn RofR validator and then submitted to the Registry of Registries.
+Once the registry is live on the IDF, the OAI-PMH endpoint is run through the RofR validator and then submitted to the Registry of Registries.
 
 After that, our current understanding is that GAVO, EuroVO and other global searchable registries will harvest
 RSP records automatically and that changes typically should propagate within a day.
@@ -801,7 +899,7 @@ This should be part of the deployment checklist for the first IDF deployment.
 
 ### 11.4 Integration Environment
 
-As described in Section 8.4, the registry will be enabled on the integration IDF
+As described in Section 8.5, the registry will be enabled on the integration IDF
 environment before production. This gives an opportunity to run the IVOA validator
 against a live endpoint and verify end-to-end harvesting behaviour before
 registering the production URL with the RofR.
